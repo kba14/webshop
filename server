@@ -1,0 +1,391 @@
+// server.js
+const express = require('express');
+const session = require('express-session');
+const http = require('http');
+const bodyParser = require('body-parser');
+const mysql = require('mysql');
+const bcryptjs = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+
+const SALT_ROUNDS = 10; // Number of salt rounds for bcryptjs encryption
+const MAXREQ = 10; // Number of max requests for rate limiting
+const INTERVAL = 60000; // Interval for rate limiting -- 1 minute
+const SESSION_SECRET = "thisisMYsecretkey"; // Secret for session
+const TOKEN_SECRET = "MYsecretkey"; // Secret for web token
+
+const app = express();
+
+// Enable CORS
+const corsOptions = {
+    origin: 'http://127.0.0.1:8080'
+};
+app.use(cors());
+
+
+// Set up database connection
+const db = mysql.createConnection({
+    host: "localhost",
+    user: "root",
+    password: "123",
+    database: "ws_database"
+});
+
+// Connect to database
+db.connect((error) => {
+    if (error) {
+        console.error('Error connecting to database:', error);   
+    }
+    else {
+        console.log('Connected to database.');
+    }
+});
+
+// Set up express-session middleware
+app.use(session({
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        maxAge: 30 * 60 * 1000 // 30 minutes
+    }
+}));
+
+// Set up body-parser middleware
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+
+// Function to query the database for search
+function searchUsernames(searchTerm, callback) {
+    const query = `SELECT username FROM users WHERE username LIKE '%${searchTerm}%'`;
+    db.query(query, (error, results) => {
+      if (error) {
+        callback(error, null);
+      } else {
+        callback(null, results);
+      }
+    });
+}
+
+// Validate password length
+const validatePasswordLength = (password) => {
+    if (password.length < 8) {
+        return false;
+    }
+    return true;
+};
+
+// Hash password
+const hashPassword = (password) => {
+    return bcryptjs.hash(password, SALT_ROUNDS);
+};
+
+// Validate password complexity
+const validatePasswordComplexity = (password) => {
+    const pattern = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[._-])[A-Za-z\d._-]{8,}$/;
+    if (!pattern.test(password)) {
+        return false;
+    }
+    return true;
+};
+
+// Validate password on registration
+const validatePassword = async (password) => {
+    if (!validatePasswordLength(password)) {
+        return { error: "Password must be at least 8 characters long." };
+    }
+    if (!validatePasswordComplexity(password)) {
+        return { error: "Password must include uppercase and lowercase letters, numbers, and special characters." };
+    }
+    const hashedPassword = await hashPassword(password);
+    return { hashedPassword };
+};
+
+// Middleware function to check if a user is authenticated
+const checkAuth = (req, res, next) => {
+    if (!req.session.user) {
+        return res.status(401).send('You are not logged in!');
+    }
+    next();
+};
+
+// Rate limiter middleware
+const rateLimiter = (maxReqPerInterval, interval) => {
+    const reqs = {};
+
+    return (req, res, next) => {
+        const ip = req.ip;
+        if (!reqs[ip]) {
+            reqs[ip] = [];
+        }
+        const currentTime = new Date();
+        reqs[ip].push(currentTime);
+        reqs[ip] = reqs[ip].filter(
+            (time) => currentTime - time < interval
+        );
+        if (reqs[ip].length > maxReqPerInterval) {
+            return res.status(429).send("Too many requests");
+        }
+        next();
+    };
+};
+
+app.use("/login", rateLimiter(MAXREQ, INTERVAL));
+
+app.use("/register", rateLimiter(MAXREQ, INTERVAL));
+
+app.use("/logout", rateLimiter(MAXREQ, INTERVAL));
+
+// Define registration route
+app.post('/register', async (req, res) => {
+    const firstname = req.body.firstName;
+    const lastname = req.body.lastName;
+    const username = req.body.userName;
+    const password = req.body.password;
+
+    // Input validation -- type, length, content
+    if (typeof firstname !== 'string' || firstname.length < 1 || firstname.length > 45 || !firstname.match(/^[a-zA-Z]+$/)) { // Only letters right now
+        return res.status(400).send('Invalid first name');
+    }
+    if (typeof lastname !== 'string' || lastname.length < 1 || lastname.length > 45 || !lastname.match(/^[a-zA-Z]+$/)) { // Only letters right now
+        return res.status(400).send('Invalid last name');
+    }
+    if (typeof username !== 'string' || username.length < 6 || username.length > 45 || !username.match(/^[a-zA-Z0-9]+$/)) {
+        return res.status(400).send('Invalid username');
+    }
+    if (typeof password !== 'string' || password.length < 8 || password.length > 45 || !password.match(/^[a-zA-Z0-9_.-]+$/)) { // Min length and content check are in validatePassword
+        // Currently password can contain: 'a-z', 'A-Z', '0-9', '_', '.', '-'
+        return res.status(400).send('Invalid password');
+    }
+
+    // Query the database to check if username is already in use
+    const query = `SELECT * FROM users WHERE username = '${username}'`;
+    const passwordValidationResult = await validatePassword(password);
+    
+    if (passwordValidationResult.error) {
+        return res.status(400).json({ error: passwordValidationResult.error });
+    }
+
+    db.query(query, (error, results) => {
+        if (error) {
+            console.error('Error querying database:', error);
+            res.status(500).send('Error querying database');
+        }
+        else if (results.length > 0) {
+            res.status(400).send('Username already in use');
+        }
+        else {
+            // Insert new user into database
+            const insertQuery = `INSERT INTO users (firstname, lastname, username, password) VALUES ('${firstname}', '${lastname}', '${username}', '${passwordValidationResult.hashedPassword}')`;
+            db.query(insertQuery, (error) => {
+                if (error) {
+                    console.error('Error inserting into database:', error);
+                    res.status(500).send('Error inserting into database');
+                }
+                else {
+                    // Generate JWT for new user
+                    //const payload = {
+                    //    username: username,
+                    //    //firstname: firstname,
+                    //    //lastname: lastname
+                    //};
+                    //const secret = TOKEN_SECRET;
+                    //const options = { expiresIn: '30m' }; // Token expires in 30 minutes
+                    //const token = jwt.sign(payload, secret, options);
+                    // Return JWT to client
+                    //res.status(200).json({ token: token });
+
+                    // Log in user after succesful registration
+                    req.session.user = {
+                        firstname: firstname,
+                        lastname: lastname,
+                        username: username,
+                        password: password,
+                        //token: token
+                    };
+                    res.sendFile(__dirname + '/account.html');
+                }
+            });
+        }
+    });
+});
+
+// Define login route
+app.post('/login', async (req, res) => {
+    const username = req.body.userName;
+    const password = req.body.password;
+
+    // Input validation
+    if (typeof username !== 'string' || username.length < 6 || username.length > 45 || !username.match(/^[a-zA-Z0-9]+$/)) {
+        return res.status(400).send('Invalid username');
+    }
+    if (typeof password !== 'string' || password.length < 8 || password.length > 45 || !password.match(/^[a-zA-Z0-9_.-]+$/)) { // Min length and content check are in validatePassword
+        // Currently password can contain: 'a-z', 'A-Z', '0-9', '_', '.', '-'
+        return res.status(400).send('Invalid password');
+    }
+
+    // Query database to retrieve user's information
+    const query = `SELECT * FROM users WHERE username = '${username}'`;
+    db.query(query, async (error, results) => {
+        if (error) {
+            console.error('Error querying database:', error);
+            res.status(500).send('Error querying database');
+        }
+        else if (results.length === 0) {
+            res.status(401).send('Username or password is incorrect');
+        }
+        else {
+            const user = results[0];
+
+            // Compare plain password with hashed password stored in the database
+            const passwordMatch = await bcryptjs.compare(password, user.password);
+            if (!passwordMatch) {
+                res.status(401).send('Username or password is incorrect');
+            }
+            else {
+                // Generate a new token
+                const token = jwt.sign({ username: username }, TOKEN_SECRET, { expiresIn: '30m' });
+                const expirationTime = new Date();
+                expirationTime.setMinutes(expirationTime.getMinutes() + 30);  // Token is alive for 30min
+                const formattedExpirationTime = expirationTime.toISOString().slice(0, 19).replace('T', ' '); // Format expirationTime to DATETIME compatibility
+
+                // Store token in database
+                const updateQuery = `UPDATE users SET token = '${token}', token_expiration = '${formattedExpirationTime}' WHERE username = '${username}'`;
+                db.query(updateQuery, (error) => {
+                    if (error) {
+                        console.error('Error inserting into database:', error, formattedExpirationTime);
+                        res.status(500).send('Error inserting into database');
+                    }
+                    else {
+                        // Store user's information in session
+                        req.session.user = user;
+                        res.sendFile(__dirname + '/account.html');
+                    }
+                })
+                
+            }
+        }
+    });
+});
+
+// Extract username from current session
+app.get('/get_username', (req, res) => {
+    // Check if the user is logged in
+    if (!req.session.user) {
+        res.status(401).send('Not logged in');
+    }
+    else {
+        // Send the user information
+        res.send(req.session.user);
+    }
+});
+
+// Logout route
+app.post('/logout', (req, res) => {
+    req.session.destroy(error => {
+        if (error) {
+            console.error('Error destroying session:', error);
+            res.status(500).send('Error destroying session');
+        }
+        else {
+            res.sendFile(__dirname + "/index.html");
+        }
+    });
+});
+
+// Search
+app.post('/search', (req, res) => {
+    const searchTerm = req.body.query;
+    searchUsernames(searchTerm, (error, results) => {
+      if (error) {
+        res.status(500).send(error.message);
+      } else {
+        res.send(results);
+      }
+    });
+  });
+
+///// Shopping cart related BEGIN
+let cart = {};
+
+// Route to get contents of cart
+app.get('/cart', cors(corsOptions), (req, res) => {
+    // Send current contents of cart as response
+    res.status(200).json(cart);
+})
+
+// Route to add an item to the cart
+app.post('/cart/add/:itemId', (req, res) => {
+    const itemId = req.params.itemId;
+    // If the item is already in the cart, increment its quantity by one
+    if (itemId in cart) {
+        cart[itemId].quantity++;
+    }
+    // Otherwise, add item to cart with quantity one
+    else {
+        cart[itemId] = {
+            name: `${itemId}`,
+            quantity: 1
+        };
+    }
+    // Send updated cart as JSON
+    res.json(cart);
+});
+
+// Route to update quantity of an item in cart
+app.put('/cart/update/:itemId', (req, res) => {
+    const itemId = req.params.itemId;
+    const newQuantity = req.body.quantity;
+    // If item already in cart, update its quantity
+    if (itemId in cart) {
+        cart[itemId].quantity = newQuantity;
+    }
+    // Send updated cart as response
+    res.json(cart);
+});
+
+// Route to remove item from cart
+app.delete('/cart/remove/:itemId', (req, res) => {
+    const itemId = req.params.itemId;
+    //If item already in cart, remove it
+    if (itemId in cart) {
+        delete cart[itemId];
+    }
+    // Send updated cart as response
+    res.json(cart);
+});
+///// Shopping cart related END
+
+///// Subpage requests BEGIN                                   
+app.get('/', (req, res) => {
+    res.sendFile(__dirname + '/index.html');
+});
+
+app.get("/login", (req, res) => {
+    res.sendFile(__dirname + "/login.html");
+});
+
+app.get("/register", (req, res) => {
+    res.sendFile(__dirname + "/register.html");
+});
+
+app.get("/products", (req, res) => {
+    res.sendFile(__dirname + "/products.html");
+});
+
+app.get("/for_distributors", (req, res) => {
+    res.sendFile(__dirname + "/for_distributors.html");
+});
+
+app.get("/3d_kitchen", (req, res) => {
+    res.sendFile(__dirname + "/3d_kitchen.html");
+});
+
+app.get("/account", checkAuth, (req, res) => {
+    res.sendFile(__dirname + "/account.html");
+});
+///// Subpage requests END
+
+app.listen(3142, () => {
+    console.log("Server running on port 3142");
+});
